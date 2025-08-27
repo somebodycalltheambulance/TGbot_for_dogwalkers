@@ -111,6 +111,16 @@ async def send_order_to_walkers_by_area(card_text: str, photo_file_id: str | Non
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.sleep(1)
 
+@dp.message(Command("whoami"))
+async def whoami_cmd(m: Message):
+    await m.answer(f"Твой Telegram ID: {m.from_user.id}")
+
+# на всякий случай дубль по тексту, если Command где-то перехватывают
+@dp.message(F.text.startswith("/whoami"))
+async def whoami_text(m: Message):
+    await m.answer(f"Твой Telegram ID: {m.from_user.id}")
+
+
 @dp.message(F.text == "👤 Работать у нас")
 async def on_work(m: Message, state: FSMContext):
     await state.set_state(WorkStates.collecting_name)
@@ -265,41 +275,56 @@ async def cmd_set_role(m: Message):
         await m.answer(f"Ошибка: {e}")
 
 @dp.message(F.text == "👤 Работать у нас")
-async def on_work(m: Message, state: FSMContext):
-    # создаём пользователя/роль
-    await db.upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name, role="walker")
-    await state.set_state(WorkStates.phone)
-    await m.answer("Телефон для связи (формат свободный):")
+async def on_work(m, state):
+    await state.set_state(WorkStates.collecting_name)
+    await m.answer("Как к тебе обращаться?")
 
-@dp.message(WorkStates.phone, F.text)
+@dp.message(WorkStates.collecting_name, F.text)
+async def work_name(m, state):
+    await state.update_data(name=m.text.strip()[:64])
+    await state.set_state(WorkStates.collecting_phone)
+    await m.answer("Телефон с +, напр. +79990000000")
+
+@dp.message(WorkStates.collecting_phone, F.text)
 async def w_phone(m: Message, state: FSMContext):
     await state.update_data(phone=m.text.strip()[:32])
     await state.set_state(WorkStates.city)
     await m.answer("Город:")
 
-@dp.message(WorkStates.city, F.text)
-async def w_city(m: Message, state: FSMContext):
-    await state.update_data(city=m.text.strip()[:64])
-    await state.set_state(WorkStates.areas)
-    await m.answer("Районы/локации (через запятую):")
+@dp.message(WorkStates.collecting_exp, F.text)
+async def work_exp(m, state):
+    import re
+    bio = m.text.strip()[:500]
+    m_rate = re.search(r"\b(\d{3,5})\b", bio)
+    rate = int(m_rate.group(1)) if m_rate else None
+    await state.update_data(bio=bio, rate=rate)
+    await state.set_state(WorkStates.collecting_areas)
+    await m.answer("Районы через запятую (например: Центр, Савёловский).")
 
-@dp.message(WorkStates.areas, F.text)
-async def w_areas(m: Message, state: FSMContext):
-    await state.update_data(areas=m.text.strip()[:128])
-    await state.set_state(WorkStates.experience)
-    await m.answer("Пару слов об опыте:")
+@dp.message(WorkStates.collecting_phone, F.text)
+async def work_phone(m, state):
+    phone = m.text.strip().replace(" ", "")
+    if not phone.startswith("+") or len(phone) < 10:
+        return await m.reply("Дай телефон формата +7...")
+    await state.update_data(phone=phone)
+    await state.set_state(WorkStates.collecting_exp)
+    await m.answer("Коротко об опыте. Можно указать ставку (числом).")
 
-@dp.message(WorkStates.experience, F.text)
+@dp.message(WorkStates.collecting_exp, F.text)
 async def w_experience(m: Message, state: FSMContext):
     await state.update_data(experience=m.text.strip()[:300])
     await state.set_state(WorkStates.price_from)
     await m.answer("Базовая ставка (руб, число):")
-
-@dp.message(WorkStates.price_from, F.text)
-async def w_price(m: Message, state: FSMContext):
-    val = _clean_int(m.text)
-    if val is None or val < 0 or val > 1_000_000:
-        return await m.reply("Нужно число от 0 до 1_000_000.")
+    
+@dp.message(WorkStates.collecting_areas, F.text)
+async def work_areas(m, state):
+    areas = m.text.strip()[:200]
+    data = await state.get_data()
+    await db.upsert_user(m.from_user.id, m.from_user.username, data["name"], role="walker")
+    await db.upsert_walker_profile(m.from_user.id, phone=data.get("phone"), bio=data.get("bio"),
+            price_from=data.get("rate"), areas=areas)
+    await state.clear()
+    await m.answer(f"Готово! Роль выдана (walker). Районы: {areas or '—'}")
 
 
 # ====================== Главный мастер заказа ======================
@@ -613,6 +638,7 @@ async def on_faq(m: Message):
 @dp.message()
 async def fallback(m: Message):
     await m.answer("Ткни в меню ниже, не забивай голову 🙂", reply_markup=main_menu())
+
 
 # ====================== main ======================
 async def main():

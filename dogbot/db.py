@@ -131,17 +131,19 @@ INIT_SQL_SQLITE = [
         walker_id   INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
         assigned_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS walker_profiles (
-    walker_id   INTEGER PRIMARY KEY REFERENCES users(tg_id) ON DELETE CASCADE,
-    phone       TEXT,
-    city        TEXT,
-    areas       TEXT,
-    experience  TEXT,
-    price_from  INTEGER,
-    bio         TEXT,
-    is_approved INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
+        walker_id   INTEGER PRIMARY KEY REFERENCES users(tg_id) ON DELETE CASCADE,
+        phone       TEXT,
+        city        TEXT,
+        areas       TEXT,
+        experience  TEXT,
+        price_from  INTEGER,
+        bio         TEXT,
+        is_approved INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     """,
 ]
 
@@ -302,7 +304,7 @@ async def list_proposals(order_id: int) -> List[Dict[str, Any]]:
     sql = """
     SELECT p.id, p.price, p.note, p.walker_id,
            u.username, u.full_name,
-           wp.phone, wp.rate, wp.areas
+           wp.phone, wp.price_from AS rate, wp.areas
     FROM proposals p
     LEFT JOIN users u ON u.tg_id = p.walker_id
     LEFT JOIN walker_profiles wp ON wp.walker_id = p.walker_id
@@ -382,30 +384,45 @@ async def list_walkers_ids() -> list[int]:
 
 async def upsert_walker_profile(
     walker_id: int,
-    phone: str | None,
-    city: str | None,
-    areas: str | None,
-    experience: str | None,
-    price_from: int | None,
-    bio: str | None,
+    phone: str | None = None,
+    city: str | None = None,
+    areas: str | None = None,
+    experience: str | None = None,
+    price_from: int | None = None,
+    bio: str | None = None,
+    is_approved: int | None = None,
+    **extra,  # на случай если кто-то передаст rate=...
 ) -> None:
+    # алиас: если пришёл rate — кладём его в price_from
+    if price_from is None and "rate" in extra and isinstance(extra["rate"], (int, str)):
+        try:
+            price_from = int(extra["rate"])
+        except Exception:
+            price_from = None
+
     sql = """
-    INSERT INTO walker_profiles (walker_id, phone, city, areas, experience, price_from, bio)
-    VALUES (:wid, :phone, :city, :areas, :experience, :price_from, :bio)
+    INSERT INTO walker_profiles (walker_id, phone, city, areas, experience, price_from, bio, is_approved)
+    VALUES (:wid, :phone, :city, :areas, :experience, :price_from, :bio, COALESCE(:is_approved, 0))
     ON CONFLICT (walker_id) DO UPDATE SET
         phone=EXCLUDED.phone,
         city=EXCLUDED.city,
         areas=EXCLUDED.areas,
         experience=EXCLUDED.experience,
         price_from=EXCLUDED.price_from,
-        bio=EXCLUDED.bio;
+        bio=EXCLUDED.bio,
+        is_approved=COALESCE(EXCLUDED.is_approved, walker_profiles.is_approved);
     """
     engine = get_engine()
     async with engine.begin() as conn:
         await _exec(conn, sql, {
             "wid": walker_id,
-            "phone": phone, "city": city, "areas": areas,
-            "experience": experience, "price_from": price_from, "bio": bio
+            "phone": phone,
+            "city": city,
+            "areas": areas,
+            "experience": experience,
+            "price_from": price_from,
+            "bio": bio,
+            "is_approved": is_approved,
         })
 
 async def set_walker_approval(walker_id: int, approved: bool) -> None:
@@ -416,17 +433,21 @@ async def set_walker_approval(walker_id: int, approved: bool) -> None:
 
 async def get_walker_profile(walker_id: int) -> dict | None:
     sql = """
-    SELECT u.tg_id, u.username, u.full_name, u.role,
-           p.phone, p.city, p.areas, p.experience, p.price_from, p.bio, p.is_approved
-    FROM users u
-    LEFT JOIN walker_profiles p ON p.walker_id = u.tg_id
-    WHERE u.tg_id=:wid;
+    SELECT
+        walker_id,
+        phone,
+        bio,
+        price_from AS rate,   -- 👈 алиас, чтобы в коде/тестах был ключ 'rate'
+        areas
+    FROM walker_profiles
+    WHERE walker_id = :wid;
     """
     engine = get_engine()
     async with engine.connect() as conn:
         res = await _exec(conn, sql, {"wid": walker_id})
         row = res.mappings().first()
         return dict(row) if row else None
+
 
 async def list_walkers_ids() -> list[int]:
     # теперь только одобренные
