@@ -324,7 +324,11 @@ async def work_areas(m, state):
     await db.upsert_walker_profile(m.from_user.id, phone=data.get("phone"), bio=data.get("bio"),
             price_from=data.get("rate"), areas=areas)
     await state.clear()
-    await m.answer(f"Готово! Роль выдана (walker). Районы: {areas or '—'}")
+    await m.answer(
+        f"🎉 Готово! Теперь заказы по твоим районам будут приходить в ЛС.\n"
+        f"Районы: {areas or '—'}\n\n"
+        "Команды: /profile, /set_areas, /set_rate."
+    )
 
 
 # ====================== Главный мастер заказа ======================
@@ -634,6 +638,57 @@ async def on_call_manager(m: Message):
 @dp.message(F.text == "❓ Общие вопросы")
 async def on_faq(m: Message):
     await m.answer("FAQ прикрутим позже. Сейчас главный сценарий — заявки/отклики/выбор.")
+
+
+@dp.message(Command("profile"))
+async def cmd_profile(m: Message):
+    p = await db.get_walker_profile(m.from_user.id)
+    if not p:
+        return await m.answer("Профиль не найден. Нажми «👤 Работать у нас» и заполни анкету.")
+    rate = f"{p.get('rate')}₽/ч" if p.get('rate') else "—"
+    areas = p.get('areas') or "—"
+    phone = p.get('phone') or "—"
+    await m.answer(
+        f"👤 Твой профиль исполнителя\n"
+        f"Телефон: {phone}\n"
+        f"Ставка: {rate}\n"
+        f"Районы: {areas}"
+    )
+
+@dp.message(Command("set_areas"))
+async def cmd_set_areas(m: Message, state: FSMContext):
+    txt = (m.text or "")
+    parts = txt.split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /set_areas Центр, Купчино")
+    areas = parts[1][:200]
+    # подтянем текущий профиль (чтобы не затереть другое)
+    p = await db.get_walker_profile(m.from_user.id) or {}
+    await db.upsert_walker_profile(
+        walker_id=m.from_user.id,
+        phone=p.get("phone"),
+        bio=p.get("bio"),
+        price_from=p.get("rate"),
+        areas=areas,
+    )
+    await m.answer(f"Районы обновлены: {areas}")
+
+@dp.message(Command("set_rate"))
+async def cmd_set_rate(m: Message):
+    txt = (m.text or "").replace(" ", "")
+    parts = txt.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await m.answer("Использование: /set_rate 600")
+    rate = int(parts[1])
+    p = await db.get_walker_profile(m.from_user.id) or {}
+    await db.upsert_walker_profile(
+        walker_id=m.from_user.id,
+        phone=p.get("phone"),
+        bio=p.get("bio"),
+        price_from=rate,
+        areas=p.get("areas"),
+    )
+    await m.answer(f"Ставка обновлена: {rate}₽/ч")
 
 @dp.message()
 async def fallback(m: Message):
