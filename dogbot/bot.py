@@ -274,6 +274,87 @@ async def cmd_set_role(m: Message):
     except Exception as e:
         await m.answer(f"Ошибка: {e}")
 
+@dp.message(Command("candidates"))
+async def cmd_candidates(m: Message):
+    parts = (m.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await m.answer("Использование: /candidates <order_id>")
+    oid = int(parts[1])
+    order = await db.get_order(oid)
+    if not order or order["client_id"] != m.from_user.id:
+        return await m.answer("Заказ не найден или не ваш.")
+    text, kb = await _render_candidates(oid)
+    await m.answer(text, reply_markup=kb)
+
+@dp.message(Command("cancel_order"))
+async def cmd_cancel_order(m: Message):
+    parts = (m.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await m.answer("Использование: /cancel_order <order_id>")
+    oid = int(parts[1])
+    order = await db.get_order(oid)
+    if not order or order["client_id"] != m.from_user.id:
+        return await m.answer("Заказ не найден или не ваш.")
+    if order["status"] in ("done", "cancelled"):
+        return await m.answer(f"Нельзя отменить: статус {order['status']}.")
+    # уведомим назначенного, если есть
+    asg = await db.get_assignment(oid)
+    await db.cancel_order(oid)
+    await m.answer("Заказ отменён.")
+    if asg:
+        try:
+            await bot.send_message(asg["walker_id"], f"❗️ Клиент отменил заказ #{oid}.")
+        except Exception:
+            pass
+
+@dp.message(Command("reschedule"))
+async def cmd_reschedule(m: Message):
+    # /reschedule <order_id> <YYYY-MM-DD> <HH:MM> <duration_min>
+    parts = (m.text or "").split()
+    if len(parts) != 5 or not parts[1].isdigit() or not parts[4].isdigit():
+        return await m.answer("Использование: /reschedule <order_id> 2025-09-01 19:00 60")
+    oid = int(parts[1]); duration = int(parts[4])
+    order = await db.get_order(oid)
+    if not order or order["client_id"] != m.from_user.id:
+        return await m.answer("Заказ не найден или не ваш.")
+    if order["status"] in ("done", "cancelled"):
+        return await m.answer(f"Нельзя изменить: статус {order['status']}.")
+    try:
+        when_at = dt.datetime.fromisoformat(parts[2] + " " + parts[3])
+        if when_at.tzinfo is None:
+            when_at = when_at.replace(tzinfo=dt.timezone.utc)  # или твоя TZ
+    except Exception:
+        return await m.answer("Дата/время кривые. Пример: 2025-09-01 19:00")
+    await db.update_order_time(oid, when_at, duration)
+    await m.answer(f"Время обновлено: {when_at} ({duration} мин).")
+
+@dp.message(Command("set_address"))
+async def cmd_set_address(m: Message):
+    # /set_address <order_id> <адрес целиком>
+    parts = (m.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return await m.answer("Использование: /set_address <order_id> Ул. Пример, 1")
+    oid = int(parts[1]); addr = parts[2][:200]
+    order = await db.get_order(oid)
+    if not order or order["client_id"] != m.from_user.id:
+        return await m.answer("Заказ не найден или не ваш.")
+    if order["status"] in ("done", "cancelled"):
+        return await m.answer(f"Нельзя изменить: статус {order['status']}.")
+    await db.update_order_address(oid, addr)
+    await m.answer(f"Адрес обновлён: {addr}")
+
+@dp.message(Command("my_orders"))
+async def cmd_my_orders(m: Message):
+    orders = await db.list_orders_by_client(m.from_user.id)
+    if not orders:
+        return await m.answer("У вас нет заказов.")
+    
+    lines = []
+    for o in orders:
+        lines.append(f"#{o['id']} — {o['service']} {o['pet_name']} ({o['status']})")
+    await m.answer("Ваши заказы:\n" + "\n".join(lines))
+
+
 @dp.message(F.text == "👤 Работать у нас")
 async def on_work(m, state):
     await state.set_state(WorkStates.collecting_name)
@@ -325,10 +406,11 @@ async def work_areas(m, state):
             price_from=data.get("rate"), areas=areas)
     await state.clear()
     await m.answer(
-        f"🎉 Готово! Теперь заказы по твоим районам будут приходить в ЛС.\n"
-        f"Районы: {areas or '—'}\n\n"
-        "Команды: /profile, /set_areas, /set_rate."
-    )
+    "🎉 Готово! Профиль исполнителя создан. "
+    "После одобрения модератором заказы по твоим районам будут приходить в ЛС.\n"
+    f"Районы: {areas or '—'}\n\n"
+    "Команды: /profile, /set_areas, /set_rate."
+)
 
 
 # ====================== Главный мастер заказа ======================
@@ -530,6 +612,31 @@ async def cb_become_walker(cq: CallbackQuery):
     await cq.message.reply("Готово. Теперь у тебя роль walker. Можно откликаться.")
     await cq.answer()
 
+async def _render_candidates(order_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    props = await db.list_proposals(order_id)
+    if not props:
+        return "Пока нет откликов.", InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"cands:{order_id}")]
+        ])
+
+    lines, rows = [], []
+    for p in props:
+        name = p.get("full_name") or f"id {p['walker_id']}"
+        username = f"@{p['username']}" if p.get("username") else ""
+        rate = f", ставка {p['rate']}₽/ч" if p.get("rate") else ""
+        phone = f", {p['phone']}" if p.get("phone") else ""
+        note = p.get("note") or "—"
+        lines.append(f"• {name} {username}{rate}{phone} — {p['price']}₽ — {note}")
+        rows.append([
+            InlineKeyboardButton(text=f"✅ Выбрать {name}", callback_data=f"choose:{order_id}:{p['walker_id']}"),
+            InlineKeyboardButton(text="ℹ️ Профиль", callback_data=f"prof:{order_id}:{p['walker_id']}")
+        ])
+    text = "Кандидаты:\n" + "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=rows + [
+        [InlineKeyboardButton(text="↩️ Назад", callback_data=f"order:{order_id}")]
+    ])
+    return text, kb
+
 @dp.message(ProposalStates.waiting_price, F.text)
 async def proposal_price(m: Message, state: FSMContext):
     txt = (m.text or "").strip().replace(" ", "")
@@ -603,7 +710,10 @@ async def cb_candidates(cq: CallbackQuery):
 
         lines.append(f"• {name} {username}{rate}{phone} — {p['price']}₽ — {note}")
 
-        rows.append([InlineKeyboardButton(text=f"✅ Выбрать {name}", callback_data=f"choose:{order_id}:{p['walker_id']}")])
+        rows.append([
+    InlineKeyboardButton(text=f"✅ Выбрать {name}", callback_data=f"choose:{order_id}:{p['walker_id']}"),
+    InlineKeyboardButton(text="ℹ️ Профиль", callback_data=f"prof:{order_id}:{p['walker_id']}"),
+])
     await cq.message.reply(f"Кандидаты на #{order_id}:\n" + "\n".join(lines),
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cq.answer()
@@ -625,6 +735,43 @@ async def cb_choose(cq: CallbackQuery):
     except Exception as e:
         logging.warning("notify parties failed: %s", e)
     await cq.answer()
+
+@dp.callback_query(F.data.startswith("prof:"))
+async def cb_profile(cq: CallbackQuery):
+    try:
+        _, oid, wid = cq.data.split(":")
+        order_id = int(oid); walker_id = int(wid)
+    except Exception:
+        await cq.answer("что-то не то с данными", show_alert=True)
+        return
+
+    u = await db.get_user(walker_id) or {}
+    p = await db.get_walker_profile(walker_id) or {}
+
+    name = u.get("full_name") or f"id {walker_id}"
+    username = f"@{u.get('username')}" if u.get("username") else ""
+    phone = p.get("phone") or "—"
+    rate = f"{p.get('rate')}₽/ч" if p.get("rate") else "—"
+    areas = p.get("areas") or "—"
+    bio = p.get("bio") or "—"
+
+    text = (
+        f"ℹ️ Профиль исполнителя\n"
+        f"{name} {username}\n"
+        f"Телефон: {phone}\n"
+        f"Ставка: {rate}\n"
+        f"Районы: {areas}\n"
+        f"О себе: {bio}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Выбрать {name}", callback_data=f"choose:{order_id}:{walker_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к кандидатам", callback_data=f"cands:{order_id}")],
+    ])
+
+    await cq.message.reply(text, reply_markup=kb)
+    await cq.answer()
+
 
 # ====================== Прочее меню ======================
 @dp.message(F.text == "📞 Позвать менеджера")
@@ -689,6 +836,56 @@ async def cmd_set_rate(m: Message):
         areas=p.get("areas"),
     )
     await m.answer(f"Ставка обновлена: {rate}₽/ч")
+
+def _is_admin(uid: int) -> bool:
+    return uid in settings.ADMIN_IDS
+
+@dp.message(Command("pending"))
+async def cmd_pending(m: Message):
+    if not _is_admin(m.from_user.id):
+        return
+    rows = await db.list_pending_walkers()
+    if not rows:
+        return await m.answer("Очередь пустая.")
+    out = []
+    for r in rows[:20]:
+        name = r.get("full_name") or f"id {r['tg_id']}"
+        user = f"@{r['username']}" if r.get("username") else ""
+        rate = f"{r.get('rate')}₽/ч" if r.get("rate") else "—"
+        areas = r.get("areas") or "—"
+        out.append(f"• {name} {user} id={r['tg_id']} | ставка: {rate} | районы: {areas}")
+    await m.answer("Ожидают одобрения:\n" + "\n".join(out))
+
+@dp.message(Command("approve"))
+async def cmd_approve(m: Message):
+    if not _is_admin(m.from_user.id):
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await m.answer("Использование: /approve <tg_id>")
+    wid = int(parts[1])
+    await db.set_walker_approval(wid, True)
+    await m.answer(f"✅ Одобрил walker {wid}")
+    try:
+        await bot.send_message(wid, "✅ Твой профиль одобрен. Теперь ты получаешь заказы по своим районам.")
+    except Exception:
+        pass
+
+@dp.message(Command("reject"))
+async def cmd_reject(m: Message):
+    if not _is_admin(m.from_user.id):
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await m.answer("Использование: /reject <tg_id>")
+    wid = int(parts[1])
+    await db.set_walker_approval(wid, False)
+    await m.answer(f"❌ Отклонил walker {wid}")
+    try:
+        await bot.send_message(wid, "❌ Профиль пока не одобрен. Проверь корректность анкеты и свяжись с менеджером.")
+    except Exception:
+        pass
+
 
 @dp.message()
 async def fallback(m: Message):

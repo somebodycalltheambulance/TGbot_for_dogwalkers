@@ -139,9 +139,9 @@ INIT_SQL_SQLITE = [
         city        TEXT,
         areas       TEXT,
         experience  TEXT,
+        is_approved INTEGER NOT NULL DEFAULT 0,
         price_from  INTEGER,
         bio         TEXT,
-        is_approved INTEGER NOT NULL DEFAULT 0,
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
     """,
@@ -155,9 +155,8 @@ async def _exec(conn: AsyncConnection, sql: str, params: Dict[str, Any] | None =
 # --------------------- API ---------------------
 async def init_db() -> None:
     """
-    Создать таблицы, если их нет, с учётом диалекта.
-    После DDL — «ленивая миграция»: пытаемся добавить колонку orders.area,
-    если она уже есть — молча игнорируем.
+    Создать таблицы, если их нет.
+    После DDL — «ленивые миграции»: добавим недостающие колонки.
     """
     from sqlalchemy.exc import OperationalError
 
@@ -167,27 +166,31 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         # --- базовый DDL ---
         if backend == "sqlite":
-            # SQLite: каждый стейтмент по отдельности
             for stmt in INIT_SQL_SQLITE:
                 await _exec(conn, stmt)
         else:
-            # Postgres (и прочие): можно порезать multi-statement по ';'
             for stmt in (s.strip() for s in INIT_SQL_POSTGRES.split(";")):
                 if not stmt:
                     continue
                 await _exec(conn, stmt + ";")
 
-        # --- «ленивая миграция»: добавить колонку orders.area ---
-        # в обоих диалектах ADD COLUMN без DEFAULT и NOT NULL — безопасно
-        try:
-            await _exec(conn, "ALTER TABLE orders ADD COLUMN area TEXT;")
-        except OperationalError:
-            # колонка уже есть или диалект ворчит — не страшно
-            pass
-        except Exception:
-            # на всякий пожарный — не роняем и идём дальше
-            pass
-        
+        # --- ленивые ALTER'ы ---
+        alters = [
+            # orders.area
+            "ALTER TABLE orders ADD COLUMN area TEXT;",
+            # walker_profiles.is_approved (по умолчанию 0)
+            "ALTER TABLE walker_profiles ADD COLUMN is_approved INTEGER NOT NULL DEFAULT 0;",
+        ]
+        for sql in alters:
+            try:
+                await _exec(conn, sql)
+            except OperationalError:
+                # колонка уже есть — ок
+                pass
+            except Exception:
+                # не роняем приложение
+                pass
+
 
 
 async def upsert_user(
@@ -277,13 +280,43 @@ async def list_orders_by_client(client_id: int) -> List[Dict[str, Any]]:
         return [dict(row) for row in res.mappings().all()]
 
 
-async def get_order(order_id: int) -> Optional[Dict[str, Any]]:
+async def get_order(order_id: int) -> dict | None:
     sql = "SELECT * FROM orders WHERE id=:oid;"
     engine = get_engine()
     async with engine.connect() as conn:
         res = await _exec(conn, sql, {"oid": order_id})
         row = res.mappings().first()
         return dict(row) if row else None
+    
+# кто назначен
+async def get_assignment(order_id: int) -> dict | None:
+    sql = "SELECT order_id, walker_id, assigned_at FROM assignments WHERE order_id=:oid;"
+    engine = get_engine()
+    async with engine.connect() as conn:
+        res = await _exec(conn, sql, {"oid": order_id})
+        row = res.mappings().first()
+        return dict(row) if row else None
+
+# отмена заказа (клиентом/админом)
+async def cancel_order(order_id: int) -> None:
+    sql = "UPDATE orders SET status='cancelled' WHERE id=:oid AND status <> 'cancelled';"
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await _exec(conn, sql, {"oid": order_id})
+
+# правка времени/длительности
+async def update_order_time(order_id: int, when_at: dt.datetime, duration_min: int) -> None:
+    sql = "UPDATE orders SET when_at=:t, duration_min=:d WHERE id=:oid;"
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await _exec(conn, sql, {"oid": order_id, "t": when_at, "d": duration_min})
+
+# правка адреса
+async def update_order_address(order_id: int, address: str) -> None:
+    sql = "UPDATE orders SET address=:a WHERE id=:oid;"
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await _exec(conn, sql, {"oid": order_id, "a": address})
 
 
 async def add_proposal(order_id: int, walker_id: int, price: int, note: Optional[str]) -> int:
@@ -300,11 +333,11 @@ async def add_proposal(order_id: int, walker_id: int, price: int, note: Optional
         return int(res.scalar_one())
 
 
-async def list_proposals(order_id: int) -> List[Dict[str, Any]]:
+async def list_proposals(order_id: int) -> list[dict]:
     sql = """
     SELECT p.id, p.price, p.note, p.walker_id,
            u.username, u.full_name,
-           wp.phone, wp.price_from AS rate, wp.areas
+           wp.phone, wp.price_from AS rate, wp.areas, wp.is_approved
     FROM proposals p
     LEFT JOIN users u ON u.tg_id = p.walker_id
     LEFT JOIN walker_profiles wp ON wp.walker_id = p.walker_id
@@ -318,7 +351,6 @@ async def list_proposals(order_id: int) -> List[Dict[str, Any]]:
 
 
 async def assign_walker(order_id: int, walker_id: int) -> bool:
-    """Назначение исполнителя. В Postgres лочим строку, в SQLite — без FOR UPDATE (тестовый режим)."""
     engine = get_engine()
     backend = engine.url.get_backend_name()
     lock_sql = (
@@ -328,13 +360,11 @@ async def assign_walker(order_id: int, walker_id: int) -> bool:
     )
 
     async with engine.begin() as conn:
-        # 1) проверяем статус (и лочим в PG)
         chk = await _exec(conn, lock_sql, {"oid": order_id})
         row = chk.mappings().first()
         if not row or row["status"] not in ("open", "published"):
             return False
 
-        # 2) создаём/обновляем назначение
         await _exec(
             conn,
             """
@@ -344,7 +374,6 @@ async def assign_walker(order_id: int, walker_id: int) -> bool:
             """,
             {"oid": order_id, "wid": walker_id},
         )
-        # 3) переводим заказ в assigned
         await _exec(conn, "UPDATE orders SET status='assigned' WHERE id=:oid;", {"oid": order_id})
         return True
     
@@ -374,14 +403,6 @@ async def set_user_role(tg_id: int, role: str) -> None:
     async with engine.begin() as conn:
         await _exec(conn, sql, {"uid": tg_id, "role": role})
 
-async def list_walkers_ids() -> list[int]:
-    sql = "SELECT tg_id FROM users WHERE role='walker';"
-    engine = get_engine()
-    async with engine.connect() as conn:
-        res = await _exec(conn, sql)
-        return [row[0] for row in res.fetchall()]
-
-
 async def upsert_walker_profile(
     walker_id: int,
     phone: str | None = None,
@@ -391,9 +412,8 @@ async def upsert_walker_profile(
     price_from: int | None = None,
     bio: str | None = None,
     is_approved: int | None = None,
-    **extra,  # на случай если кто-то передаст rate=...
+    **extra,
 ) -> None:
-    # алиас: если пришёл rate — кладём его в price_from
     if price_from is None and "rate" in extra and isinstance(extra["rate"], (int, str)):
         try:
             price_from = int(extra["rate"])
@@ -425,12 +445,6 @@ async def upsert_walker_profile(
             "is_approved": is_approved,
         })
 
-async def set_walker_approval(walker_id: int, approved: bool) -> None:
-    sql = "UPDATE walker_profiles SET is_approved=:ap WHERE walker_id=:wid;"
-    engine = get_engine()
-    async with engine.begin() as conn:
-        await _exec(conn, sql, {"ap": approved, "wid": walker_id})
-
 async def get_walker_profile(walker_id: int) -> dict | None:
     sql = """
     SELECT
@@ -448,7 +462,6 @@ async def get_walker_profile(walker_id: int) -> dict | None:
         row = res.mappings().first()
         return dict(row) if row else None
 
-
 async def list_walkers_ids() -> list[int]:
     # теперь только одобренные
     sql = "SELECT walker_id FROM walker_profiles WHERE is_approved=1;"
@@ -458,17 +471,77 @@ async def list_walkers_ids() -> list[int]:
         return [r[0] for r in res.fetchall()]
 
 async def list_walkers_by_area(area: str) -> list[int]:
-    """
-    Очень простой матч: ищем area как подстроку в wp.areas (CSV/текст).
-    Для продакшена делаем нормализацию/таблицу.
-    """
-    sql = "SELECT u.tg_id FROM users u JOIN walker_profiles wp ON wp.walker_id=u.tg_id WHERE u.role='walker' AND wp.areas ILIKE :a;"
-    # В SQLite нет ILIKE — подменим на LIKE с lower()
     engine = get_engine()
     backend = engine.url.get_backend_name()
     if backend == "sqlite":
-        sql = "SELECT u.tg_id FROM users u JOIN walker_profiles wp ON wp.walker_id=u.tg_id WHERE u.role='walker' AND lower(wp.areas) LIKE lower(:a);"
+        sql = """
+        SELECT u.tg_id
+        FROM users u
+        JOIN walker_profiles wp ON wp.walker_id=u.tg_id
+        WHERE u.role='walker'
+          AND COALESCE(wp.is_approved,0)=1
+          AND lower(COALESCE(wp.areas,'')) LIKE lower(:a);
+        """
+    else:
+        sql = """
+        SELECT u.tg_id
+        FROM users u
+        JOIN walker_profiles wp ON wp.walker_id=u.tg_id
+        WHERE u.role='walker'
+          AND COALESCE(wp.is_approved,0)=1
+          AND wp.areas ILIKE :a;
+        """
     a = f"%{area}%"
     async with engine.connect() as conn:
         res = await _exec(conn, sql, {"a": a})
         return [row[0] for row in res.fetchall()]
+
+async def set_walker_approval(walker_id: int, approved: bool) -> None:
+    """
+    Одобрить или отклонить профиль исполнителя.
+    """
+    sql = """
+    INSERT INTO walker_profiles (walker_id, is_approved)
+    VALUES (:wid, :ap)
+    ON CONFLICT (walker_id) DO UPDATE SET is_approved=EXCLUDED.is_approved;
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await _exec(conn, sql, {
+            "wid": walker_id,
+            "ap": 1 if approved else 0   # ✅ конвертируем bool → int
+        })
+
+    """
+    Одобрение/отклонение профиля. Если профиля нет — создадим-заглушим.
+    """
+    sql = """
+    INSERT INTO walker_profiles (walker_id, is_approved)
+    VALUES (:wid, :appr)
+    ON CONFLICT (walker_id) DO UPDATE SET is_approved=EXCLUDED.is_approved;
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await _exec(conn, sql, {"wid": walker_id, "appr": 1 if approved else 0})
+
+async def list_pending_walkers() -> list[dict]:
+    sql = """
+    SELECT u.tg_id, u.full_name, u.username,
+           wp.phone, wp.price_from AS rate, wp.areas, wp.bio, wp.is_approved
+    FROM users u
+    LEFT JOIN walker_profiles wp ON wp.walker_id = u.tg_id
+    WHERE u.role='walker' AND COALESCE(wp.is_approved,0)=0
+    ORDER BY u.tg_id;
+    """
+    engine = get_engine()
+    async with engine.connect() as conn:
+        res = await _exec(conn, sql)
+        return [dict(r) for r in res.mappings().all()]
+    
+async def get_user(tg_id: int) -> dict | None:
+    sql = "SELECT tg_id, username, full_name FROM users WHERE tg_id=:uid;"
+    engine = get_engine()
+    async with engine.connect() as conn:
+        res = await _exec(conn, sql, {"uid": tg_id})
+        row = res.mappings().first()
+        return dict(row) if row else None
